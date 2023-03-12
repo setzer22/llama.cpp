@@ -1,4 +1,5 @@
 #include "ggml.h"
+#include "httplib.h"
 
 #include "utils.h"
 
@@ -13,6 +14,7 @@
 
 #include <signal.h>
 #include <unistd.h>
+
 
 #define ANSI_COLOR_RED     "\x1b[31m"
 #define ANSI_COLOR_GREEN   "\x1b[32m"
@@ -757,48 +759,10 @@ void sigint_handler(int signo) {
     }
 }
 
-int main(int argc, char ** argv) {
-    ggml_time_init();
-    const int64_t t_main_start_us = ggml_time_us();
-
-    gpt_params params;
-    params.model = "models/llama-7B/ggml-model.bin";
-
-    if (gpt_params_parse(argc, argv, params) == false) {
-        return 1;
-    }
-
-    if (params.seed < 0) {
-        params.seed = time(NULL);
-    }
-
-    printf("%s: seed = %d\n", __func__, params.seed);
-
-    std::mt19937 rng(params.seed);
-    if (params.prompt.empty()) {
-        params.prompt = gpt_random_prompt(rng);
-    }
-
-//    params.prompt = R"(// this function checks if the number n is prime
-//bool is_prime(int n) {)";
-
-    int64_t t_load_us = 0;
-
-    gpt_vocab vocab;
-    llama_model model;
-
-    // load the model
-    {
-        const int64_t t_start_us = ggml_time_us();
-
-        if (!llama_model_load(params.model, model, vocab, 512)) {  // TODO: set context from user input ??
-            fprintf(stderr, "%s: failed to load model from '%s'\n", __func__, params.model.c_str());
-            return 1;
-        }
-
-        t_load_us = ggml_time_us() - t_start_us;
-    }
-
+/// Performs inference with the given prompt and antiprompt
+bool infer_with_prompt(const gpt_params &params, const llama_model &model,
+                       gpt_vocab &vocab, std::mt19937 &rng, std::string prompt,
+                       std::string antiprompt) {
     int n_past = 0;
 
     int64_t t_sample_us  = 0;
@@ -807,12 +771,10 @@ int main(int argc, char ** argv) {
     std::vector<float> logits;
 
     // tokenize the prompt
-    std::vector<gpt_vocab::id> embd_inp = ::llama_tokenize(vocab, params.prompt, true);
-
-    params.n_predict = std::min(params.n_predict, model.hparams.n_ctx - (int) embd_inp.size());
+    std::vector<gpt_vocab::id> embd_inp = ::llama_tokenize(vocab, prompt, true);
 
     // tokenize the reverse prompt
-    std::vector<gpt_vocab::id> antiprompt_inp = ::llama_tokenize(vocab, params.antiprompt, false);
+    std::vector<gpt_vocab::id> antiprompt_inp = ::llama_tokenize(vocab, antiprompt, false);
 
     printf("\n");
     printf("%s: prompt: '%s'\n", __func__, params.prompt.c_str());
@@ -825,7 +787,7 @@ int main(int argc, char ** argv) {
         struct sigaction sigint_action;
         sigint_action.sa_handler = sigint_handler;
         sigemptyset (&sigint_action.sa_mask);
-        sigint_action.sa_flags = 0; 
+        sigint_action.sa_flags = 0;
         sigaction(SIGINT, &sigint_action, NULL);
 
         printf("%s: interactive mode on.\n", __func__);
@@ -860,7 +822,7 @@ int main(int argc, char ** argv) {
                " - If you want to submit another line, end your input in '\\'.\n");
     }
 
-    int remaining_tokens = params.n_predict;
+    int remaining_tokens = std::min(params.n_predict, model.hparams.n_ctx - (int) embd_inp.size());
     int input_consumed = 0;
     bool input_noecho = false;
 
@@ -880,7 +842,7 @@ int main(int argc, char ** argv) {
 
             if (!llama_eval(model, params.n_threads, n_past, embd, logits, mem_per_token)) {
                 printf("Failed to predict\n");
-                return 1;
+                return false;
             }
 
             t_predict_us += ggml_time_us() - t_start_us;
@@ -953,7 +915,7 @@ int main(int argc, char ** argv) {
                 is_interacting = true;
             }
             if (is_interacting) {
-                // currently being interactive 
+                // currently being interactive
                 bool another_line=true;
                 while (another_line) {
                     char buf[256] = {0};
@@ -978,7 +940,7 @@ int main(int argc, char ** argv) {
                     input_noecho = true; // do not echo this again
                 }
 
-                is_interacting = false;            
+                is_interacting = false;
             }
         }
 
@@ -996,11 +958,65 @@ int main(int argc, char ** argv) {
 
         printf("\n\n");
         printf("%s: mem per token = %8zu bytes\n", __func__, mem_per_token);
-        printf("%s:     load time = %8.2f ms\n", __func__, t_load_us/1000.0f);
         printf("%s:   sample time = %8.2f ms\n", __func__, t_sample_us/1000.0f);
         printf("%s:  predict time = %8.2f ms / %.2f ms per token\n", __func__, t_predict_us/1000.0f, t_predict_us/1000.0f/n_past);
-        printf("%s:    total time = %8.2f ms\n", __func__, (t_main_end_us - t_main_start_us)/1000.0f);
     }
+
+    return true;
+}
+
+int main(int argc, char ** argv) {
+    ggml_time_init();
+    const int64_t t_main_start_us = ggml_time_us();
+
+    gpt_params params;
+    params.model = "models/llama-7B/ggml-model.bin";
+
+    if (gpt_params_parse(argc, argv, params) == false) {
+        return 1;
+    }
+
+    if (params.seed < 0) {
+        params.seed = time(NULL);
+    }
+
+    printf("%s: seed = %d\n", __func__, params.seed);
+
+    std::mt19937 rng(params.seed);
+    if (params.prompt.empty()) {
+        params.prompt = gpt_random_prompt(rng);
+    }
+
+//    params.prompt = R"(// this function checks if the number n is prime
+//bool is_prime(int n) {)";
+
+    int64_t t_load_us = 0;
+
+    gpt_vocab vocab;
+    llama_model model;
+
+    // load the model
+    {
+        const int64_t t_start_us = ggml_time_us();
+
+        if (!llama_model_load(params.model, model, vocab, 512)) {  // TODO: set context from user input ??
+            fprintf(stderr, "%s: failed to load model from '%s'\n", __func__, params.model.c_str());
+            return 1;
+        }
+
+        t_load_us = ggml_time_us() - t_start_us;
+    }
+    printf("%s:     load time = %8.2f ms\n", __func__, t_load_us/1000.0f);
+
+    // Run inference with the provided prompt
+    infer_with_prompt(
+        params,
+        model,
+        vocab,
+        rng,
+        params.prompt,
+        params.antiprompt
+    );
 
     ggml_free(model.ctx);
 
