@@ -965,6 +965,55 @@ bool infer_with_prompt(const gpt_params &params, const llama_model &model,
     return true;
 }
 
+void stream_output(httplib::Response& res) {
+
+    int counter = 0;
+
+    // Define a lambda function to provide the response body in chunks
+    auto chunk_provider = [counter] (size_t offset, httplib::DataSink& sink) mutable {
+        // Vector of strings to output
+        std::vector<std::string> words = {"This", "is", "a", "test", "string", "for", "streaming", "output."};
+        printf("inside chunk provider. Offset %d Size %d\n", offset, words.size());
+
+        if (counter >= words.size()) {
+            printf("No more data?\n");
+            sink.done();
+            return -1;  // No more data
+        } else {
+            printf("Yes more data?\n");
+        }
+
+        std::string word = words[counter] + " ";
+        counter += 1;
+        printf("Counter is: %d", counter);
+        const char* data = word.c_str();
+        size_t length = word.size();
+
+        printf("Word: %s\n", word.c_str());
+
+        sink.write(data, length);
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+
+        return static_cast<int>(length);
+    };
+
+    // Set the content provider to the lambda function
+    res.set_chunked_content_provider("text/plain", chunk_provider);
+}
+
+void start_server() {
+    httplib::Server srv;
+    srv.Get("/stream_output", [](const httplib::Request &, httplib::Response &res) {
+        stream_output(res);
+    });
+
+    std::string host = "localhost";
+    int port = 4277;
+    printf("Listening on %s:%d\n", host.c_str(), port);
+    srv.listen(host, port);
+}
+
 int main(int argc, char ** argv) {
     ggml_time_init();
     const int64_t t_main_start_us = ggml_time_us();
@@ -1007,6 +1056,8 @@ int main(int argc, char ** argv) {
         t_load_us = ggml_time_us() - t_start_us;
     }
     printf("%s:     load time = %8.2f ms\n", __func__, t_load_us/1000.0f);
+
+    start_server();
 
     // Run inference with the provided prompt
     infer_with_prompt(
